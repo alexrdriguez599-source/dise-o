@@ -1,0 +1,10 @@
+<svg width="520" height="190" viewBox="0 0 520 190" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- single-line house signature -->
+  <path d="M40 158 L40 78 L260 30 L480 78 L480 158 Z" fill="none" stroke="#16352a" stroke-width="4" stroke-linejoin="round" stroke-linecap="round" opacity="0.4"/>
+  <!-- arch A -->
+  <path d="M150 138 L176 64 Q184 46 192 64 L218 138" fill="none" stroke="#16352a" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M166 112 L202 112" fill="none" stroke="#c8a96a" stroke-width="7" stroke-linecap="round"/>
+  <circle cx="184" cy="56" r="3.4" fill="#c8a96a"/>
+  <!-- wordmark -->
+  <text x="232" y="138" font-family="'Cormorant Garamond', Georgia, serif" font-weight="600" font-size="92" letter-spacing="14" fill="#16352a">TRIA</text>
+</svg>
