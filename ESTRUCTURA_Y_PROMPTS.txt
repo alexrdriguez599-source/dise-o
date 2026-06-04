@@ -1,0 +1,539 @@
+================================================================================
+ URBAN AI GARDEN DESIGNER — ESTRUCTURA COMPLETA, CONEXIONES Y PROMPTS BLINDADOS
+================================================================================
+ Documento técnico paso a paso. Plataforma SaaS de paisajismo con IA para
+ paisajistas mexicanos. Render fotorrealista (WaveSpeed / Google Nano-Banana Pro),
+ multiusuario con autenticación, inventario, proyectos, CRM y simulación GeoSim.
+
+ REGLA DE ORO (PRODUCCIÓN): los prompts de cada módulo están BLINDADOS.
+ La IA JAMÁS debe cambiar colores, materiales ni posiciones, ni inventar
+ elementos que no estén en el diseño. "Recolor nothing, invent nothing."
+================================================================================
+
+
+0) MAPA GENERAL DEL PROYECTO (MONOREPO pnpm)
+--------------------------------------------------------------------------------
+Raíz del repositorio (monorepo gestionado con pnpm workspaces):
+
+  /
+  ├── artifacts/
+  │   ├── garden-designer/   → FRONTEND (React + Vite)  — lo que ve el usuario
+  │   └── api-server/        → BACKEND  (Express 5)      — API + orquesta la IA
+  ├── lib/
+  │   ├── db/                → Esquema de base de datos (Drizzle ORM)
+  │   ├── api-spec/          → Contrato OpenAPI (openapi.yaml)
+  │   ├── api-zod/           → Esquemas Zod generados (validación)
+  │   └── api-client-react/  → Hooks React Query (cliente API)
+  ├── scripts/               → Utilidades de repositorio
+  ├── replit.md              → README del proyecto
+  ├── pnpm-workspace.yaml    → Descubrimiento de paquetes del workspace
+  └── package.json           → Orquestación de tareas (typecheck, build)
+
+FLUJO DE ALTO NIVEL (qué se conecta con qué):
+
+  [Usuario navegador]
+        │  (HTTPS, proxy de Replit por ruta)
+        ▼
+  FRONTEND  artifacts/garden-designer   (ruta "/")
+        │  fetch /api/...  (cookie JWT + Bearer)
+        ▼
+  BACKEND   artifacts/api-server         (ruta "/api")
+        │            │
+        │            ├──► PostgreSQL (vía lib/db, Drizzle ORM)
+        │            └──► WaveSpeed API (renders de IA)
+        ▼
+  Respuesta (imagen base64 / datos JSON) de vuelta al frontend
+
+
+================================================================================
+ 1) BASE DE DATOS — lib/db  (Drizzle ORM + PostgreSQL)
+================================================================================
+Archivo fuente de verdad del esquema: lib/db/src/schema/index.ts
+Config del pool de conexiones:        lib/db/src/index.ts
+  (pool: max=20, idleTimeout=30s, connectionTimeout=5s)
+
+TABLAS PRINCIPALES:
+  • users      → cuentas (username, password hash bcrypt, role, credits, status)
+  • usageLogs  → bitácora de consumo de créditos (userId, action, creditsUsed)
+  • projects   → proyectos de diseño guardados (datos del cliente + lienzo)
+  • inventory  → inventario por usuario, sincronizado del catálogo admin
+
+CONEXIÓN: tanto el backend (api-server) como las libs importan `@workspace/db`.
+Los créditos se descuentan de forma ATÓMICA con SQL `credits = credits - N`
+para evitar condiciones de carrera con peticiones concurrentes.
+
+
+================================================================================
+ 2) BACKEND — artifacts/api-server  (Express 5)
+================================================================================
+Punto de entrada:     src/index.ts      → arranca el servidor (lee PORT)
+Configuración Express: src/app.ts        → middlewares, CORS, JSON, montaje rutas
+Logger:               src/lib/logger.ts → logging (req.log en handlers, logger global)
+Seed admin:          src/lib/seed-admin.ts → crea el admin inicial al arrancar
+                       (requiere ADMIN_SEED_USERNAME / ADMIN_SEED_PASSWORD)
+
+MIDDLEWARE DE AUTENTICACIÓN: src/middlewares/auth.ts
+  • Extrae el JWT (cookie o cabecera Bearer)
+  • requireAuth  → exige sesión válida
+  • requireAdmin → exige rol admin
+  CONEXIÓN: casi todas las rutas pasan por requireAuth; las /admin por requireAdmin.
+
+--------------------------------------------------------------------------------
+ RUTAS (src/routes/*) — cada módulo y sus endpoints
+--------------------------------------------------------------------------------
+  index.ts      → registra y monta todas las rutas bajo /api
+
+  auth.ts       → /api/auth/login, /logout, /me
+                  Login usuario+contraseña → emite JWT (cookie, sesión 7 días)
+
+  ai.ts         → /api/ai/chat, /identify-plant, /suggest-design,
+                  /design-plan, /analyze-garden
+                  Herramientas IA de alto nivel + descuento de créditos.
+                  (chat/identify/suggest/analyze son placeholders por ahora;
+                   design-plan SÍ genera lista de materiales/BOM real.)
+
+  wavespeed.ts  → /api/ai/wavespeed/inpaint, /apply-material, /design-auto,
+                  /render-final, /magazine-render, /clean-terrain,
+                  /status/:jobId
+                  ★ MÓDULO CENTRAL DE RENDER IA. Orquesta WaveSpeed.
+                  Aquí viven los prompts blindados (sección 5).
+
+  inventory.ts  → /api/inventory  (GET/POST/PUT/DELETE)
+                  Inventario por usuario. Cache en memoria (TTL 10 min).
+
+  projects.ts   → /api/projects  (GET/POST/PATCH/DELETE)
+                  Guardar/cargar proyectos. Whitelisting de campos en updates
+                  (no se puede sobrescribir userId, createdAt, etc.).
+
+  admin.ts      → /api/admin/users, /users/:id/credits, /usage-logs,
+                  /sync-catalog, /payments
+                  CRUD de usuarios, gestión de créditos (atómica), pagos,
+                  sincronización de catálogo (paralelizada con Promise.allSettled).
+
+  geosim.ts     → /api/geosim/*    motor de simulación de crecimiento de plantas
+  learning.ts   → /api/learning/*  contenido educativo
+  download.ts   → /api/download/*  descargas/exportaciones
+  health.ts     → /api/healthz     verificación de salud
+
+PATRÓN ASÍNCRONO DE RENDER (importante):
+  Los renders de IA pueden tardar. El backend:
+   1. Llama a WaveSpeed (startJob).
+   2. Si termina rápido → devuelve { imageBase64 } directo.
+   3. Si tarda → devuelve { jobId, status:"pending" }.
+   4. El frontend hace polling a /api/ai/wavespeed/status/:jobId cada 3s
+      hasta status "completed" (con imageBase64) o "failed".
+  Esto mantiene cada petición HTTP por debajo del límite de 120s del proxy.
+
+
+================================================================================
+ 3) FRONTEND — artifacts/garden-designer  (React + Vite)
+================================================================================
+Punto de entrada:  src/pages/main.tsx
+
+CONTEXTOS GLOBALES (src/context/):
+  • auth-context.tsx → sesión del usuario y créditos (carga vía /api/auth/me)
+  • app-context.tsx  → estado de la "sesión de diseño" (imagen activa,
+                       elementos del diseño, datos del proyecto, costos)
+
+PÁGINAS (src/pages/) — cada una y a qué API/servicio se conecta:
+  • main.tsx        → router raíz de la app
+  • design.tsx      → ESTUDIO DE DISEÑO principal (subir foto, aplicar
+                      materiales, generar diseño). Usa design-canvas y
+                      wavespeed-fetch → /api/ai/wavespeed/*. Guarda en
+                      /api/projects vía use-auto-save.
+  • presentacion.tsx→ RENDER REVISTA (magazine-render) + presentación al
+                      cliente. Construye el prompt con buildNanaBananaPrompt()
+                      y llama wavespeed-fetch → /api/ai/wavespeed/magazine-render.
+                      ★ Aquí están los prompts Conservador/Creativo (sección 5.A).
+  • cad-designer.tsx→ herramienta de medición CAD (usa spatial-engine.ts)
+  • brush.tsx       → pincel de materiales sobre el lienzo
+  • inventario.tsx  → inventario del usuario → /api/inventory
+  • clientes.tsx    → CRM de clientes (almacenamiento local crm-db.ts)
+  • client-form.tsx → alta/edición de cliente
+  • admin.tsx       → panel admin → /api/admin/* (usa components/admin-panel)
+  • geosim.tsx      → simulación de crecimiento → /api/geosim/*
+  • not-found.tsx   → página 404
+
+SERVICIOS (src/services/) — lógica reutilizable:
+  • auth.ts             → login/headers de autenticación (authHeaders)
+  • wavespeed-fetch.ts  → cliente del patrón render asíncrono (POST + polling)
+  • ai-assistant.ts     → utilidades del asistente IA del cliente
+  • material-system.ts  → definición/aplicación de materiales
+  • design-engine.ts    → motor de composición del diseño
+  • offline-design-engine.ts / offline-storage.ts / offline-sync.ts
+                          → modo sin conexión (local-first)
+  • crm-db.ts           → CRM local en IndexedDB (clientes, proyectos, borradores)
+  • pdf-generator.ts    → genera el PDF de propuesta (lado cliente)
+  • export-engine.ts    → exportaciones
+  • coverage-engine.ts / polygon-manager.ts / spatial-engine.ts
+                          → cálculos geométricos (áreas, polígonos, medidas)
+  • edge-detector.ts / image-layer.ts / mountain-generator.ts
+                          → utilidades de imagen y capas
+  • learning.ts         → contenido educativo
+  • project-save.ts     → guardado de proyectos
+
+HOOKS (src/hooks/):
+  • use-auto-save.ts → sincroniza IndexedDB local ↔ /api/projects (remoto)
+
+COMPONENTES (src/components/):
+  • design-canvas.tsx → lienzo de diseño; prepara imagen + máscara y llama
+                        wavespeed-fetch (aplicar material / render).
+  • components/ui/    → componentes base (shadcn/ui)
+  • components/inventory/ → UI de inventario
+  • admin-panel       → panel de administración
+
+
+================================================================================
+ 4) FLUJOS PASO A PASO (qué llama a qué)
+================================================================================
+A) AUTENTICACIÓN
+   1. Frontend services/auth.ts → POST /api/auth/login (usuario+contraseña)
+   2. Backend auth.ts valida → emite JWT en cookie (sesión 7 días)
+   3. Al cargar la app, auth-context.tsx → GET /api/auth/me (usuario+créditos)
+
+B) APLICAR MATERIAL (pasto/piedra/etc.) — design.tsx
+   1. design-canvas.tsx construye imagen base + máscara (PNG binario)
+   2. → wavespeed-fetch.ts → POST /api/ai/wavespeed/apply-material
+   3. Backend descuenta 1 crédito → llama WaveSpeed (flux-fill-dev)
+   4. Devuelve imagen o jobId; el frontend hace polling si hay jobId
+   5. design-canvas compone el resultado de vuelta en la foto
+
+C) GENERAR DISEÑO COMPLETO — design.tsx
+   → POST /api/ai/wavespeed/design-auto  (flux-fill-dev, por estilo + inventario)
+
+D) RENDER REVISTA (foto profesional) — presentacion.tsx
+   1. presentacion.tsx → buildNanaBananaPrompt() arma el prompt corto blindado
+   2. → wavespeed-fetch.ts → POST /api/ai/wavespeed/magazine-render
+   3. Backend → WaveSpeed google/nano-banana-pro/edit (1 solo paso)
+   4. Devuelve JPEG (~2048px) + retryToken para un reintento gratis
+
+E) GUARDADO DE PROYECTO
+   UI → app-context.tsx → use-auto-save.ts → IndexedDB (local)
+                                          → POST/PATCH /api/projects → PostgreSQL
+
+F) ADMIN
+   admin.tsx → /api/admin/users, /credits (atómico), /usage-logs, /sync-catalog
+
+
+================================================================================
+ 5) PROMPTS BLINDADOS POR MÓDULO  ★★★ NO MODIFICAR SIN PERMISO EXPLÍCITO ★★★
+================================================================================
+ PRINCIPIOS VALIDADOS (aplican a todos los prompts de render):
+   • PROMPT CORTO Y ESTRICTO. Prompts largos hacen que el modelo "promedie"
+     instrucciones, desobedezca e invente. Corto = máxima fidelidad al diseño.
+   • USAR VERBOS ACTIVOS para renderizar ("Transform/Convert this design into a
+     photo"). Frases pasivas ("keep unchanged, add realism only") hacen que el
+     modelo devuelva una copia plana sin realismo.
+   • FIJAR COLOR Y MATERIAL DE CADA OBJETO explícitamente. "Keep in place" no
+     basta: el modelo recolorea (una tumbona NEGRA salió BLANCA = error crítico).
+   • LAS SOMBRAS necesitan dirección de luz explícita; sin ella el render sale
+     plano y sin profundidad.
+   • PROHIBIDO INVENTAR: "Recolor nothing, move nothing, invent nothing."
+
+--------------------------------------------------------------------------------
+ 5.A) RENDER REVISTA / MAGAZINE-RENDER  (Google Nano-Banana Pro)
+      Ubicación: artifacts/garden-designer/src/pages/presentacion.tsx
+                 función buildNanaBananaPrompt()
+      Modelo:    google/nano-banana-pro/edit
+      NOTA del modelo: NO acepta strength, guidance_scale, negative_prompt,
+                       seed ni num_steps. La única palanca de calidad es el texto.
+      ★ ESTOS DOS PROMPTS ESTÁN APROBADOS POR EL CLIENTE Y CONGELADOS ★
+--------------------------------------------------------------------------------
+  MODO "CREATIVO" (cinematográfico, luz cálida de tarde):
+  --------------------------------------------------------
+  "Transform this design into a cinematic 8K HDR photograph. Warm afternoon
+   sunlight, dramatic realistic shadows, depth of field. Keep every object's
+   exact color, material and position — furniture keeps its original color.
+   Recolor nothing, move nothing, invent nothing."
+
+  MODO "CONSERVADOR" (hiperrealista de día, luz clara, sin amarillo):
+  ------------------------------------------------------------------
+  "Convert this design into a hyperrealistic 8K DSLR photo. Bright clear
+   daylight, soft long shadows, realistic grass and leaf texture, sharp natural
+   detail. Keep every object's exact color, material and position. Recolor
+   nothing, invent nothing."
+
+  Historial (para NO repetir errores):
+   - Conservador con "golden-hour/warm" salía demasiado amarillo e idéntico al
+     Creativo → se cambió a "bright clear daylight" (sin cálido/dorado).
+   - "soft long shadows" son las sombras aprobadas por el cliente — conservar.
+   - "hyperrealistic 8K DSLR photo" + "realistic grass and leaf texture, sharp
+     natural detail" fue lo que quitó el aspecto de render 3D/CGI.
+
+--------------------------------------------------------------------------------
+ 5.B) APLICAR MATERIAL  (/api/ai/wavespeed/apply-material)
+      Ubicación: artifacts/api-server/src/routes/wavespeed.ts  (materialPrompts)
+      Modelo:    wavespeed-ai/flux-fill-dev (inpainting con máscara)
+      Cada material tiene prompt POSITIVO y NEGATIVO + semilla fija (mismo
+      input → mismo estilo de salida). Materiales: grass, white-stone,
+      grey-stone, red-stone, black-stone, marble, gravel, soil, mulch,
+      concrete, multi-stone.
+--------------------------------------------------------------------------------
+  PASTO (grass) — POSITIVO:
+  "((VIVID EMERALD GREEN GRASS LAWN)), ((bright saturated green color)),
+   ((healthy living Zoysia grass)), ((rich kelly green color)), Professional
+   DSLR garden photo of a lush GREEN Zoysia grass lawn, COLOR IS VIVID EMERALD
+   GREEN. Ultra-dense carpet of short dark-green blades uniformly mowed at 1 cm.
+   Rich saturated green color fills the entire ground area. Compact carpet-like
+   surface with no individual tall blade stalks. Same green texture from
+   foreground to background. Warm Mexican sunlight, photorealistic quality.
+   ((Color: #2d7a2d emerald green, NOT brown, NOT tan, NOT beige, NOT dirt))."
+  PASTO (grass) — NEGATIVO:
+  "((brown ground)), ((tan dirt)), ((beige soil)), ((dirt color)),
+   ((bare earth)), ((unchanged dirt)), ((empty lot)), ((dry ground)), yellow
+   grass, yellow, golden, amber, straw, wheat, ochre, tan, beige, brown grass,
+   dry grass, dead grass, burnt grass, drought, dormant grass, yellowish green,
+   pale green, artificial turf, synthetic, fake, plastic, cartoon, illustration,
+   painting, digital art, 3D render, CGI, concrete, stone, gravel, dirt, mud,
+   soil showing through, raw earth, brown patches, neon green, oversaturated,
+   blur, watermark, text, tall grass, long grass, uncut, overgrown, patchy,
+   individual visible stalks, foreground tall blades, upright blade tips,
+   perspective elongation"
+
+  PIEDRA BOLA BLANCA (white-stone) — POSITIVO:
+  "Photorealistic ground cover of smooth round white river stones (piedra bola
+   blanca / canto rodado blanco), each stone naturally polished by water, 6–14 cm
+   diameter per individual stone, densely packed with tiny gaps between them,
+   subtle drop shadows on contact points, warm Mexican garden daylight, shot from
+   above at 45°. Individual stones are clearly visible and distinct. Ultra-sharp
+   macro photo, no digital art, no filters."
+
+  PIEDRA BOLA GRIS (grey-stone) — POSITIVO:
+  "Photorealistic ground cover of smooth round gray river stones (piedra bola
+   gris / canto rodado gris), naturally water-polished, 6–14 cm diameter per
+   stone, medium gray with slight natural color variation (charcoal, silver,
+   slate), densely packed, realistic shadows between stones, Mexican garden
+   outdoor sunlight. Each stone individually visible. Ultra-sharp photo quality,
+   no filters."
+
+  TEZONTLE ROJO (red-stone) — POSITIVO:
+  "Photorealistic ground cover of red tezontle volcanic stone (tezontle rojo),
+   iconic Mexican volcanic rock, irregular rough chunks 3–10 cm each, deep
+   terracotta-red to dark rust-red porous surface, naturally matte finish,
+   densely packed, warm outdoor Mexican garden sunlight. Ultra-realistic photo,
+   individual pieces clearly distinguishable. No flat illustration, no digital art."
+
+  TEZONTLE NEGRO (black-stone) — POSITIVO:
+  "Photorealistic ground cover of black tezontle volcanic stone (tezontle negro /
+   basalto volcánico), Mexican dark volcanic rock, rough porous irregular chunks
+   3–8 cm each, very dark gray to matte black color, lightly textured surface,
+   densely packed, outdoor garden lighting with natural highlights. Ultra-realistic
+   photo, individual pieces visible. No flat illustration."
+
+  MÁRMOL TRITURADO (marble) — POSITIVO:
+  "Photorealistic ground cover of crushed white marble chips (mármol blanco
+   triturado), angular and sharp-edged pieces 1–3 cm each, bright white with
+   subtle gray veins and translucent quality, densely and uniformly packed,
+   luxury upscale Mexican garden, bright outdoor sunlight creating sparkle and
+   micro-shadows. Ultra-sharp macro photo, premium clean look. No flat illustration."
+
+  GRAVA FINA (gravel) — POSITIVO:
+  "Photorealistic ground cover of fine river gravel (grava de río fina), small
+   rounded pebbles 1–3 cm diameter, natural sandy-beige and gray tones with warm
+   color variation, uniformly and tightly packed, smooth natural garden path
+   texture, warm outdoor Mexican sunlight. Ultra-sharp photo quality, seamless
+   texture."
+
+  TIERRA (soil) — POSITIVO:
+  "Photorealistic natural garden soil filling the masked area, clean slightly
+   moist dark brown earth, flat garden ground ready for planting, realistic soil
+   texture with small natural crumbles, warm Mexican outdoor light. Seamless with
+   surroundings. No objects on surface."
+
+  MULCH DE MADERA (mulch) — POSITIVO:
+  "Photorealistic natural wood chip mulch ground cover filling the masked area,
+   organic brown bark chips and wood shavings 3–8 cm, warm earthy brown tones with
+   natural variation, garden bed surface, realistic outdoor Mexican garden lighting.
+   Ultra-sharp photo quality."
+
+  CONCRETO (concrete) — POSITIVO:
+  "Photorealistic smooth clean light gray concrete floor filling the masked area,
+   flat and uniform hardscape surface, modern Mexican garden patio or walkway,
+   slightly textured concrete finish, outdoor ambient lighting matching
+   surroundings. Ultra-sharp photo quality, no cracks."
+
+  MULTICOLOR (multi-stone) — POSITIVO:
+  "Photorealistic ground cover of mixed colored river stones (canto rodado
+   multicolor), smooth naturally-rounded stones in white, beige, tan, gray and
+   warm brown tones, 6–14 cm diameter each, densely packed, natural outdoor
+   sunlight with soft shadows. Ultra-sharp photo quality."
+
+--------------------------------------------------------------------------------
+ 5.C) AUTO-PASTO SIN MÁSCARA  (apply-material, material=grass, sin máscara)
+      Ubicación: wavespeed.ts (autoGrassPrompt). PROMPT CORTO BLINDADO.
+      Solo convierte tierra/suelo desnudo a pasto; NUNCA toca pavimento.
+--------------------------------------------------------------------------------
+  POSITIVO:
+  "Realistic photo edit. Turn ONLY brown dirt and bare soil into natural green
+   Zoysia lawn. Keep all roads, asphalt, concrete, sidewalks, paths, pavers,
+   curbs, buildings and structures 100% identical to the input. Grass stops at
+   pavement edge. Natural green, not neon. Nothing else changes."
+  NEGATIVO:
+  "grass on road, grass on pavement, grass on concrete, grass on sidewalk, grass
+   on path, covering road, covering pavement, covering walkway, covering driveway,
+   neon green, fluorescent, cartoon, artificial turf, plastic, yellow grass, dead
+   grass, brown grass, added trees, added plants, new objects, changed buildings,
+   changed sky"
+
+--------------------------------------------------------------------------------
+ 5.D) GENERAR DISEÑO POR ESTILO  (/api/ai/wavespeed/design-auto)
+      Ubicación: wavespeed.ts (stylePrompts). Modelo: flux-fill-dev.
+      Inyecta las plantas del inventario del cliente (máx 12) en el prompt.
+      Estilos: moderno, tropical, minimalista, rustico.
+--------------------------------------------------------------------------------
+  MODERNO — POSITIVO:
+  "Photorealistic professional modern luxury Mexican garden design filling only
+   the masked area. Contemporary landscaping with clean architectural lines, white
+   marble gravel ground cover (mármol triturado), polished stepping stones,
+   precision-trimmed hedges, ornamental grasses. Warm golden-hour afternoon Mexican
+   sunlight, ultra-sharp professional landscape photography, seamlessly blends with
+   surrounding terrain."
+
+  TROPICAL — POSITIVO:
+  "Photorealistic lush vibrant tropical Mexican garden design filling only the
+   masked area. Dense layered tropical vegetation, river stone pathways, rich dark
+   organic mulch, layered canopy, warm humid daylight. Ultra-sharp professional
+   landscape photography, seamlessly blends with surrounding terrain."
+
+  MINIMALISTA — POSITIVO:
+  "Photorealistic minimalist zen garden design filling only the masked area.
+   Japanese-Mexican fusion: raked white marble gravel, intentionally placed smooth
+   river stones (piedra bola), perfect symmetry and balance, lots of negative
+   space, serene premium aesthetic. Soft diffused outdoor light, ultra-sharp
+   professional photography, seamlessly blends with surrounding terrain."
+
+  RÚSTICO — POSITIVO:
+  "Photorealistic rustic natural Mexican garden design filling only the masked
+   area. Red tezontle volcanic stone paths, terracotta pots, wildflower ground
+   cover, rough stone edging, warm terracotta and earth tones. Bright Mexican
+   midday sun, ultra-sharp professional landscape photography, seamlessly blends
+   with surrounding terrain."
+
+  INYECCIÓN DE INVENTARIO (se añade al positivo cuando hay plantas):
+  "MANDATORY: The design MUST visually include these specific plants from the
+   client's inventory: {LISTA}. These exact plant species must be clearly
+   recognizable and prominently featured in the composition."
+
+--------------------------------------------------------------------------------
+ 5.E) RENDER FINAL  (/api/ai/wavespeed/render-final)
+      Ubicación: wavespeed.ts (enhancePrompt). Modelos: flux-fill-dev (con
+      máscara, protege plantas) o flux-kontext-dev (sin máscara).
+--------------------------------------------------------------------------------
+  CON MÁSCARA (solo mejora el suelo editable):
+  "Imagen hiperrealista fotorealista, render profesional de arquitectura de
+   paisajismo, calidad fotográfica como tomada con cámara DSLR. SOLO mejorar las
+   áreas de suelo editables: grava blanca fina o piedra bola blanca con cada piedra
+   individual visible, bordes nítidos y micro-sombras de contacto, variación
+   natural de color sutil, textura de suelo de jardín mexicano premium. Iluminación
+   natural de día soleado con sombras suaves y realistas. Alta resolución, 8K,
+   detalles fotográficos precisos, calidad de revista de arquitectura."
+
+  SIN MÁSCARA (render fotorrealista completo, MANTIENE el layout):
+  "Imagen hiperrealista fotorealista de un patio o jardín diseñado
+   profesionalmente, render profesional de arquitectura de paisajismo 3D de máxima
+   calidad, MANTÉN exactamente el mismo layout, composición y posición de todos los
+   elementos del diseño. Vista amplia desde un ángulo ligeramente elevado,
+   perspectiva a 45 grados, profundidad de campo completa todo nítido. Suelo
+   completamente cubierto de grava blanca fina o piedra bola blanca con cada piedra
+   visible individualmente, micro-sombras realistas de contacto. Plantas y palmeras
+   con frondas ultra-nítidas, textura de tronco orgánica, translucidez natural de
+   hojas. Agua cristalina azul turquesa con reflejos realistas y causticas de luz
+   en el fondo de la piscina si existe. Muebles de exterior con materiales y
+   texturas realistas, sombras de oclusión correctas. Paredes blancas de estuco con
+   textura sutil y profundidad. Iluminación natural de día soleado con sombras
+   suaves y realistas, luz tropical cálida de mañana-mediodía, cielo azul claro con
+   relleno de luz ambiente suave. Grado de color profesional: luces cálidas
+   doradas, sombras frescas azuladas, saturación rica y natural. Alta resolución,
+   8K, detalles fotográficos precisos, calidad cinematográfica, estilo render
+   profesional de revista de arquitectura de paisajismo de lujo. El resultado debe
+   ser indistinguible de una fotografía real tomada en sitio con cámara Sony
+   A7R IV."
+  NEGATIVO:
+  "cartoon, ilustración, pintura, dibujo, arte digital, boceto, plano
+   arquitectónico, render CGI genérico, videojuego, superficies plásticas, aspecto
+   sintético, iluminación artificial de estudio, flash duro, cielo sobreexpuesto,
+   colores planos, desaturado, baja calidad, desenfoque, ruido, artefactos jpeg,
+   saturación excesiva, colores neón, marca de agua, texto, logo, personas,
+   animales, autos, cambiar posición de elementos, mover plantas, cambiar
+   composición"
+
+--------------------------------------------------------------------------------
+ 5.F) LIMPIAR TERRENO  (/api/ai/wavespeed/clean-terrain)
+      Ubicación: wavespeed.ts. Modelo: flux-kontext-dev.
+      Borra TODO objeto/basura del suelo y deja tierra limpia, PRESERVANDO
+      piscinas, pisos, muros, escaleras y estructuras fijas.
+--------------------------------------------------------------------------------
+  POSITIVO:
+  "TASK: Professional terrain clearance for landscape design. ERASE AND REMOVE
+   COMPLETELY every single object visible on the ground, no exceptions: cardboard
+   boxes, discarded boxes, abandoned boxes, trash bags, garbage, litter, waste,
+   debris, chairs, tables, sofas, benches, outdoor furniture, broken furniture,
+   flower pots, plant pots, ceramic pots, plastic containers, buckets, barrels,
+   toys, balls, bicycles, motorcycles, cars, vehicles, construction materials,
+   bricks, pipes, cables, hoses, wires, tarps, tools, machinery, equipment,
+   ladders, bags, sacks, pallets, wooden planks, metal sheets, umbrellas, parasols,
+   awnings lying on ground, ANY and ALL objects that do NOT belong to the permanent
+   terrain structure. After removing every object, fill ALL exposed soft ground
+   (grass, weeds, vegetation, dirt patches, bare earth) with clean flat neutral
+   bare earth soil — natural dark brown earth texture, smooth flat soil, seamlessly
+   blended with surrounding ground, same perspective and lighting. PRESERVE
+   UNCHANGED: swimming pools, water features, built-in concrete floors, tile
+   floors, marble floors, stone paving, decorative gravel beds, built walls, brick
+   walls, fences, gates, steps, stairs, retaining walls, pergolas, built-in
+   planters, fixed structural elements. Keep EXACT same camera angle, perspective,
+   vanishing point, lighting direction, and shadow patterns. Result: completely
+   empty clean terrain with bare soil — zero objects, zero clutter, zero
+   vegetation. Photorealistic professional DSLR photograph, natural Mexican outdoor
+   daylight."
+  NEGATIVO:
+  "boxes, cardboard boxes, trash, garbage, litter, clutter, debris, junk, waste,
+   furniture, chairs, tables, pots, toys, cars, vehicles, hoses, cables, wires,
+   pipes, construction materials, bags, sacks, tools, equipment, machinery, grass,
+   green grass, lawn, weeds, bushes, shrubs, plants, vegetation, missing pool,
+   removed pool, removed concrete, removed paving, removed walls, cartoon,
+   illustration, CGI, painting, digital art, blur, oversaturated, text, watermark,
+   changed perspective, distorted proportions, wrong angle"
+
+--------------------------------------------------------------------------------
+ 5.G) INPAINT GENÉRICO  (/api/ai/wavespeed/inpaint)
+      Ubicación: wavespeed.ts. Relleno por defecto cuando no se da prompt.
+--------------------------------------------------------------------------------
+  POSITIVO (por defecto):
+  "clean natural ground surface, bare soil or dirt, empty area, seamless
+   background fill matching surrounding terrain, no objects, no furniture, no
+   people, no shadows"
+
+
+================================================================================
+ 6) VARIABLES DE ENTORNO REQUERIDAS (secretos — nunca exponer su valor)
+================================================================================
+  DATABASE_URL          → conexión PostgreSQL
+  SESSION_SECRET        → firma de JWT/sesión
+  WAVESPEED_API_KEY     → API de render IA (si falta, los renders dan error 500)
+  ADMIN_SEED_USERNAME   → usuario admin inicial (se siembra al arrancar)
+  ADMIN_SEED_PASSWORD   → contraseña admin inicial
+
+
+================================================================================
+ 7) CÓMO EJECUTAR / OPERAR
+================================================================================
+  pnpm --filter @workspace/api-server run dev        → API (puerto 8080, /api)
+  pnpm --filter @workspace/garden-designer run dev   → Frontend (puerto 23086, /)
+  pnpm run typecheck                                 → typecheck de todo
+  pnpm run build                                     → typecheck + build
+  pnpm --filter @workspace/db run push               → aplicar cambios de esquema (dev)
+
+  NOTA: en Replit la app corre vía "workflows", no con `pnpm dev` en la raíz.
+
+
+================================================================================
+ 8) RECORDATORIO FINAL DE BLINDAJE  (PRODUCCIÓN — PARA TODO EL MUNDO)
+================================================================================
+  • Los prompts Conservador y Creativo (5.A) están APROBADOS y CONGELADOS.
+    JAMÁS cambiarlos sin petición explícita del dueño.
+  • Toda la IA tiene PROHIBIDO: cambiar color, material o posición de cualquier
+    objeto, e inventar elementos que no estén en el diseño.
+  • El modelo Nano-Banana NO tiene "semilla" fija → cada render varía un poco de
+    forma natural (como tomar dos fotos del mismo jardín). Lo que SÍ queda
+    constante es el ESTILO blindado por estos prompts.
+================================================================================
